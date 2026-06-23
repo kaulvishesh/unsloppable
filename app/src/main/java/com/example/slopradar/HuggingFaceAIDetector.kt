@@ -16,18 +16,18 @@ import java.net.URL
  */
 class HuggingFaceAIDetector(private val context: Context) : AIDetector {
 
-    // Public Hugging Face Serverless model ID for AI Image Detection
-    private val modelId = "umm-maybe/AI-image-detector"
-    private val endpointUrl = "https://api-inference.huggingface.co/models/$modelId"
+    private val defaultModelId = "umm-maybe/AI-image-detector"
 
     override fun analyzeFrame(bitmap: Bitmap): List<Detection> {
         val width = bitmap.width
         val height = bitmap.height
 
-        // 1. Fetch HF Token (check preferences first, fallback to BuildConfig)
+        // 1. Fetch settings dynamically (model ID and auth token)
         val prefs = context.getSharedPreferences("slop_radar_prefs", Context.MODE_PRIVATE)
+        val modelId = prefs.getString("selected_model_id", defaultModelId) ?: defaultModelId
+        val endpointUrl = "https://api-inference.huggingface.co/models/$modelId"
+
         var token = prefs.getString("hf_api_token", "") ?: ""
-        
         if (token.isEmpty()) {
             token = BuildConfig.HF_API_TOKEN
         }
