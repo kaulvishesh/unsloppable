@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.Rect
 import android.util.Log
 import org.json.JSONArray
+import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
@@ -37,7 +38,7 @@ class HuggingFaceAIDetector(private val context: Context) : AIDetector {
 
         // 2. Compress the bitmap into JPEG bytes to send over the network
         val outputStream = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.JPEG, 75, outputStream) // 75% quality is a good balance for ML vs data size
+        bitmap.compress(Bitmap.CompressFormat.JPEG, 75, outputStream)
         val jpegBytes = outputStream.toByteArray()
         Log.d(TAG, "Compressed frame size for upload: ${jpegBytes.size / 1024} KB")
 
@@ -68,19 +69,26 @@ class HuggingFaceAIDetector(private val context: Context) : AIDetector {
                 val responseString = connection.inputStream.bufferedReader().use { it.readText() }
                 Log.d(TAG, "Inference API response: $responseString")
 
-                // 4. Parse Hugging Face JSON output
-                // Example response: [{"label": "artificial", "score": 0.98}, {"label": "human", "score": 0.02}]
-                val jsonArray = JSONArray(responseString)
+                val trimmed = responseString.trim()
                 var aiScore = 0.0f
 
-                for (i in 0 until jsonArray.length()) {
-                    val obj = jsonArray.getJSONObject(i)
-                    val label = obj.getString("label").lowercase()
-                    val score = obj.getDouble("score").toFloat()
+                // 4. Robust JSON Parsing (Handles loading JSONObject vs result JSONArray)
+                if (trimmed.startsWith("{")) {
+                    val jsonObj = JSONObject(trimmed)
+                    if (jsonObj.has("error")) {
+                        Log.w(TAG, "Hugging Face API returned a loading warning or error: ${jsonObj.getString("error")}")
+                        return emptyList()
+                    }
+                } else if (trimmed.startsWith("[")) {
+                    val jsonArray = JSONArray(trimmed)
+                    for (i in 0 until jsonArray.length()) {
+                        val obj = jsonArray.getJSONObject(i)
+                        val label = obj.getString("label").lowercase()
+                        val score = obj.getDouble("score").toFloat()
 
-                    // Check labels commonly used by AI detection models ("artificial", "fake", "synthetic", "generator")
-                    if (label == "artificial" || label == "fake" || label.contains("synthetic") || label.contains("ai")) {
-                        aiScore = score
+                        if (label == "artificial" || label == "fake" || label.contains("synthetic") || label.contains("ai")) {
+                            aiScore = score
+                        }
                     }
                 }
 
@@ -100,7 +108,8 @@ class HuggingFaceAIDetector(private val context: Context) : AIDetector {
             }
 
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to run Hugging Face cloud inference", e)
+            // Append e.message to the main log string to make it visible under filters
+            Log.e(TAG, "Failed to run Hugging Face cloud inference. Error: ${e.message}", e)
         } finally {
             connection?.disconnect()
         }
