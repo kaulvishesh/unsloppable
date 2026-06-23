@@ -23,7 +23,6 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -34,7 +33,9 @@ class MainActivity : ComponentActivity() {
     private var overlayGranted by mutableStateOf(false)
     private var isServiceRunning by mutableStateOf(false)
     private var sensitivityThreshold by mutableStateOf(0.85f)
-    private var hfApiToken by mutableStateOf("")
+    
+    // Lifecycle flag to prevent onResume from overwriting the state during asynchronous service startup
+    private var justStartedService = false
 
     // Activity launcher for capturing MediaProjection permission dialog result
     private val mediaProjectionLauncher = registerForActivityResult(
@@ -46,8 +47,9 @@ class MainActivity : ComponentActivity() {
                 putExtra(ScreenCaptureService.EXTRA_RESULT_CODE, result.resultCode)
                 putExtra(ScreenCaptureService.EXTRA_RESULT_DATA, result.data)
             }
-            ContextCompat.startForegroundService(this, serviceIntent)
+            justStartedService = true
             isServiceRunning = true
+            ContextCompat.startForegroundService(this, serviceIntent)
         }
     }
 
@@ -57,7 +59,6 @@ class MainActivity : ComponentActivity() {
         // Load settings from SharedPreferences
         val prefs = getSharedPreferences("slop_radar_prefs", Context.MODE_PRIVATE)
         sensitivityThreshold = prefs.getFloat("sensitivity_threshold", 0.85f)
-        hfApiToken = prefs.getString("hf_api_token", "") ?: ""
 
         setContent {
             SlopRadarTheme {
@@ -65,19 +66,11 @@ class MainActivity : ComponentActivity() {
                     overlayGranted = overlayGranted,
                     isServiceRunning = isServiceRunning,
                     sensitivityThreshold = sensitivityThreshold,
-                    hfApiToken = hfApiToken,
                     onSensitivityChanged = { value ->
                         sensitivityThreshold = value
                         getSharedPreferences("slop_radar_prefs", Context.MODE_PRIVATE)
                             .edit()
                             .putFloat("sensitivity_threshold", value)
-                            .apply()
-                    },
-                    onHfTokenChanged = { token ->
-                        hfApiToken = token
-                        getSharedPreferences("slop_radar_prefs", Context.MODE_PRIVATE)
-                            .edit()
-                            .putString("hf_api_token", token)
                             .apply()
                     },
                     onGrantOverlayClick = { requestOverlayPermission() },
@@ -89,13 +82,16 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        // Sync permission, service, and settings states reactively
+        // Sync permission and service status states reactively
         overlayGranted = Settings.canDrawOverlays(this)
-        isServiceRunning = ScreenCaptureService.isRunning
+        
+        if (!justStartedService) {
+            isServiceRunning = ScreenCaptureService.isRunning
+        }
+        justStartedService = false // Reset the flag
         
         val prefs = getSharedPreferences("slop_radar_prefs", Context.MODE_PRIVATE)
         sensitivityThreshold = prefs.getFloat("sensitivity_threshold", 0.85f)
-        hfApiToken = prefs.getString("hf_api_token", "") ?: ""
     }
 
     private fun requestOverlayPermission() {
@@ -137,9 +133,7 @@ fun MainScreen(
     overlayGranted: Boolean,
     isServiceRunning: Boolean,
     sensitivityThreshold: Float,
-    hfApiToken: String,
     onSensitivityChanged: (Float) -> Unit,
-    onHfTokenChanged: (String) -> Unit,
     onGrantOverlayClick: () -> Unit,
     onToggleServiceClick: () -> Unit
 ) {
@@ -151,7 +145,7 @@ fun MainScreen(
                     colors = listOf(Color(0xFF0F0F13), Color(0xFF1F1214))
                 )
             )
-            .padding(16.dp)
+            .padding(24.dp)
     ) {
         Column(
             modifier = Modifier.fillMaxSize(),
@@ -161,20 +155,20 @@ fun MainScreen(
             // App Header
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
-                modifier = Modifier.padding(top = 8.dp)
+                modifier = Modifier.padding(top = 16.dp)
             ) {
                 Text(
                     text = "SLOP RADAR",
-                    fontSize = 32.sp,
+                    fontSize = 34.sp,
                     fontWeight = FontWeight.Black,
                     letterSpacing = 3.sp,
                     color = Color.White,
                     fontFamily = FontFamily.SansSerif
                 )
-                Spacer(modifier = Modifier.height(2.dp))
+                Spacer(modifier = Modifier.height(4.dp))
                 Text(
                     text = "Real-time AI Content Shield",
-                    fontSize = 12.sp,
+                    fontSize = 13.sp,
                     color = Color.Gray,
                     letterSpacing = 1.sp
                 )
@@ -189,12 +183,6 @@ fun MainScreen(
                 onThresholdChanged = onSensitivityChanged
             )
 
-            // Hugging Face Cloud Configuration
-            CloudSettingsCard(
-                token = hfApiToken,
-                onTokenChanged = onHfTokenChanged
-            )
-
             // Telemetry indicators
             MetricsCard()
 
@@ -202,7 +190,7 @@ fun MainScreen(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(bottom = 8.dp),
+                    .padding(bottom = 16.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 PermissionStatusIndicator(
@@ -210,7 +198,7 @@ fun MainScreen(
                     onGrantClick = onGrantOverlayClick
                 )
 
-                Spacer(modifier = Modifier.height(12.dp))
+                Spacer(modifier = Modifier.height(16.dp))
 
                 val buttonColor = if (isServiceRunning) Color(0xFFD32F2F) else Color(0xFF2979FF)
                 Button(
@@ -218,7 +206,7 @@ fun MainScreen(
                     enabled = overlayGranted,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(56.dp)
+                        .height(58.dp)
                         .clip(RoundedCornerShape(18.dp))
                         .border(
                             width = 1.dp,
@@ -241,10 +229,10 @@ fun MainScreen(
                 }
 
                 if (!overlayGranted) {
-                    Spacer(modifier = Modifier.height(8.dp))
+                    Spacer(modifier = Modifier.height(10.dp))
                     Text(
                         text = "System Overlay permission is required to display notifications.",
-                        fontSize = 11.sp,
+                        fontSize = 12.sp,
                         color = Color(0xFFE53935).copy(alpha = 0.8f),
                         textAlign = TextAlign.Center
                     )
@@ -263,18 +251,18 @@ fun StatusCard(isServiceRunning: Boolean) {
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .height(150.dp)
-            .clip(RoundedCornerShape(24.dp))
+            .height(200.dp)
+            .clip(RoundedCornerShape(28.dp))
             .background(Color(0xFF16161A))
             .border(
                 width = 2.dp,
                 brush = Brush.radialGradient(
                     colors = listOf(statusColor.copy(alpha = 0.4f), Color.Transparent),
-                    radius = 350f
+                    radius = 400f
                 ),
-                shape = RoundedCornerShape(24.dp)
+                shape = RoundedCornerShape(28.dp)
             )
-            .padding(12.dp),
+            .padding(16.dp),
         contentAlignment = Alignment.Center
     ) {
         Column(
@@ -282,29 +270,29 @@ fun StatusCard(isServiceRunning: Boolean) {
         ) {
             Box(
                 modifier = Modifier
-                    .size(56.dp)
-                    .clip(RoundedCornerShape(28.dp))
+                    .size(64.dp)
+                    .clip(RoundedCornerShape(32.dp))
                     .background(glowColor)
-                    .border(2.dp, statusColor, RoundedCornerShape(28.dp)),
+                    .border(2.dp, statusColor, RoundedCornerShape(32.dp)),
                 contentAlignment = Alignment.Center
             ) {
                 Text(
                     text = if (isServiceRunning) "📡" else "🔒",
-                    fontSize = 24.sp
+                    fontSize = 28.sp
                 )
             }
 
-            Spacer(modifier = Modifier.height(10.dp))
+            Spacer(modifier = Modifier.height(14.dp))
 
             Text(
                 text = statusText,
-                fontSize = 16.sp,
+                fontSize = 18.sp,
                 fontWeight = FontWeight.ExtraBold,
                 color = Color.White,
                 letterSpacing = 2.sp
             )
 
-            Spacer(modifier = Modifier.height(2.dp))
+            Spacer(modifier = Modifier.height(4.dp))
 
             Text(
                 text = if (isServiceRunning) "Scanning screen frames at 1 FPS" else "Standby (Awaiting Activation)",
@@ -323,12 +311,12 @@ fun SensitivityTuningCard(
     Card(
         modifier = Modifier
             .fillMaxWidth()
-            .border(1.dp, Color(0xFF26262B), RoundedCornerShape(20.dp)),
+            .border(1.dp, Color(0xFF26262B), RoundedCornerShape(24.dp)),
         colors = CardDefaults.cardColors(containerColor = Color(0xFF16161A)),
-        shape = RoundedCornerShape(20.dp)
+        shape = RoundedCornerShape(24.dp)
     ) {
         Column(
-            modifier = Modifier.padding(14.dp)
+            modifier = Modifier.padding(18.dp)
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -354,7 +342,7 @@ fun SensitivityTuningCard(
                 fontSize = 11.sp,
                 color = Color.Gray
             )
-            Spacer(modifier = Modifier.height(4.dp))
+            Spacer(modifier = Modifier.height(8.dp))
             Slider(
                 value = threshold,
                 onValueChange = onThresholdChanged,
@@ -363,59 +351,6 @@ fun SensitivityTuningCard(
                     activeTrackColor = Color(0xFF2979FF),
                     inactiveTrackColor = Color(0xFF26262B),
                     thumbColor = Color.White
-                ),
-                modifier = Modifier.height(24.dp)
-            )
-        }
-    }
-}
-
-@Composable
-fun CloudSettingsCard(
-    token: String,
-    onTokenChanged: (String) -> Unit
-) {
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .border(1.dp, Color(0xFF26262B), RoundedCornerShape(20.dp)),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF16161A)),
-        shape = RoundedCornerShape(20.dp)
-    ) {
-        Column(
-            modifier = Modifier.padding(14.dp)
-        ) {
-            Text(
-                text = "Hugging Face Cloud Config",
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Bold,
-                color = Color.White
-            )
-            Spacer(modifier = Modifier.height(2.dp))
-            Text(
-                text = "Add a free HF User Token to enable cloud classification",
-                fontSize = 11.sp,
-                color = Color.Gray
-            )
-            Spacer(modifier = Modifier.height(8.dp))
-            
-            OutlinedTextField(
-                value = token,
-                onValueChange = onTokenChanged,
-                label = { Text("Hugging Face API Token", fontSize = 11.sp) },
-                singleLine = true,
-                placeholder = { Text("hf_...", color = Color.DarkGray) },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(56.dp),
-                shape = RoundedCornerShape(10.dp),
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedBorderColor = Color(0xFF2979FF),
-                    unfocusedBorderColor = Color(0xFF26262B),
-                    focusedLabelColor = Color(0xFF2979FF),
-                    unfocusedLabelColor = Color.Gray,
-                    focusedTextColor = Color.White,
-                    unfocusedTextColor = Color.White
                 )
             )
         }
@@ -427,36 +362,36 @@ fun MetricsCard() {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(18.dp))
+            .clip(RoundedCornerShape(20.dp))
             .background(Color(0xFF121215))
-            .border(1.dp, Color(0xFF1F1F24), RoundedCornerShape(18.dp))
-            .padding(horizontal = 16.dp, vertical = 12.dp),
+            .border(1.dp, Color(0xFF1F1F24), RoundedCornerShape(20.dp))
+            .padding(horizontal = 20.dp, vertical = 14.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(text = "1 FPS", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
-            Text(text = "Scan Freq", fontSize = 9.sp, color = Color.Gray)
+            Text(text = "1 FPS", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color.White)
+            Text(text = "Scan Freq", fontSize = 10.sp, color = Color.Gray)
         }
         Box(
             modifier = Modifier
                 .width(1.dp)
-                .height(20.dp)
+                .height(24.dp)
                 .background(Color(0xFF1F1F24))
         )
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(text = "Background", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
-            Text(text = "Thread Mode", fontSize = 9.sp, color = Color.Gray)
+            Text(text = "Background", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color.White)
+            Text(text = "Thread Mode", fontSize = 10.sp, color = Color.Gray)
         }
         Box(
             modifier = Modifier
                 .width(1.dp)
-                .height(20.dp)
+                .height(24.dp)
                 .background(Color(0xFF1F1F24))
         )
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(text = "Hybrid API", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
-            Text(text = "Detection Mode", fontSize = 9.sp, color = Color.Gray)
+            Text(text = "Hybrid API", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color.White)
+            Text(text = "Detection Mode", fontSize = 10.sp, color = Color.Gray)
         }
     }
 }
@@ -472,21 +407,21 @@ fun PermissionStatusIndicator(
             .clip(RoundedCornerShape(18.dp))
             .background(Color(0xFF1A1A1E))
             .border(1.dp, Color(0xFF26262B), RoundedCornerShape(18.dp))
-            .padding(horizontal = 16.dp, vertical = 12.dp),
+            .padding(horizontal = 20.dp, vertical = 16.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween
     ) {
         Column {
             Text(
                 text = "Draw Over Other Apps",
-                fontSize = 13.sp,
+                fontSize = 14.sp,
                 fontWeight = FontWeight.Bold,
                 color = Color.White
             )
-            Spacer(modifier = Modifier.height(1.dp))
+            Spacer(modifier = Modifier.height(2.dp))
             Text(
                 text = if (granted) "Status: Enabled" else "Status: Disabled",
-                fontSize = 11.sp,
+                fontSize = 12.sp,
                 color = if (granted) Color(0xFF4CAF50) else Color(0xFFE53935)
             )
         }
@@ -495,13 +430,13 @@ fun PermissionStatusIndicator(
             Button(
                 onClick = onGrantClick,
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD32F2F)),
-                shape = RoundedCornerShape(8.dp),
-                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                shape = RoundedCornerShape(10.dp),
+                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
             ) {
-                Text("ENABLE", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                Text("ENABLE", fontSize = 12.sp, fontWeight = FontWeight.Bold)
             }
         } else {
-            Text("✅", fontSize = 16.sp)
+            Text("✅", fontSize = 18.sp)
         }
     }
 }
