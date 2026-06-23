@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.SlopRadar" parent="android:Theme.Material.Light.NoActionBar">
+        <!-- Minimalist theme configuration for POC application -->
+    </style>
+</resources>
