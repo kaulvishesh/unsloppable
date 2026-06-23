@@ -18,7 +18,7 @@ class HuggingFaceAIDetector(private val context: Context) : AIDetector {
 
     // Public Hugging Face Serverless model ID for AI Image Detection
     private val modelId = "umm-maybe/AI-image-detector"
-    private val endpointUrl = "https://api-inference.hf.co/models/$modelId"
+    private val endpointUrl = "https://api-inference.huggingface.co/models/$modelId"
 
     override fun analyzeFrame(bitmap: Bitmap): List<Detection> {
         val width = bitmap.width
