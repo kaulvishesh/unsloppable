@@ -4,30 +4,22 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Rect
 import android.util.Log
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 
-/**
- * A mock object-detector that uses lightweight frame-difference analysis (motion detection)
- * to locate active videos on screen. It filters out screen scrolling and ignores static screens.
- */
 class MockAIDetector(private val context: Context) : AIDetector {
     
-    // Cache for frame difference calculation
     private var lastTinyBitmap: Bitmap? = null
+    private var hasAnalyzedStaticState = false
 
-    override fun analyzeFrame(bitmap: Bitmap): List<Detection> {
+    override suspend fun analyzeFrame(bitmap: Bitmap): List<Detection> = withContext(Dispatchers.Default) {
         val width = bitmap.width
         val height = bitmap.height
+        Log.d(TAG, "analyzeFrame: ${width}x${height}")
         
-        // Simulating the 200ms ML model inference latency
-        try {
-            Thread.sleep(200)
-        } catch (e: InterruptedException) {
-            Log.e(TAG, "Mock inference interrupted", e)
-            Thread.currentThread().interrupt()
-            return emptyList()
-        }
+        delay(200) // Replaces Thread.sleep(200)
 
-        // Downscale to a tiny bitmap to calculate frame diff (motion detection)
         val tinyWidth = 36
         val tinyHeight = 64
         val currentTiny = Bitmap.createScaledBitmap(bitmap, tinyWidth, tinyHeight, false)
@@ -48,7 +40,6 @@ class MockAIDetector(private val context: Context) : AIDetector {
             var maxY = -1
             var movingPixelsCount = 0
             
-            // Loop through the downscaled pixels to locate changes
             for (y in 0 until tinyHeight) {
                 for (x in 0 until tinyWidth) {
                     val idx = y * tinyWidth + x
@@ -63,9 +54,8 @@ class MockAIDetector(private val context: Context) : AIDetector {
                     val g2 = (c2 shr 8) and 0xFF
                     val b2 = c2 and 0xFF
                     
-                    // L1 distance between pixel colors
                     val diff = Math.abs(r1 - r2) + Math.abs(g1 - g2) + Math.abs(b1 - b2)
-                    if (diff > 35) { // Threshold for individual pixel motion
+                    if (diff > 35) {
                         movingPixelsCount++
                         if (x < minX) minX = x
                         if (x > maxX) maxX = x
@@ -78,15 +68,16 @@ class MockAIDetector(private val context: Context) : AIDetector {
             val totalPixels = tinyWidth * tinyHeight
             val motionPercent = movingPixelsCount.toFloat() / totalPixels
             
-            // Heuristic to filter out scrolling:
-            // 1. If more than 35% of the screen pixels are changing, it's likely a global screen scroll.
-            // 2. If the moving bounding box spans more than 80% of the screen height, it's a vertical scroll.
-            val isScrolling = motionPercent > 0.35f || (maxY - minY) > (tinyHeight * 0.80f)
+            // Lenient filtering for testing: Only filter if motion is very widespread (global scroll)
+            val isScrolling = motionPercent > 0.70f || (maxY - minY) > (tinyHeight * 0.94f)
             
+            Log.d(TAG, "Analysis: movingPixelsCount=$movingPixelsCount, motionPercent=${String.format("%.2f", motionPercent)}, isScrolling=$isScrolling, hasAnalyzedStaticState=$hasAnalyzedStaticState, bounds=[$minX, $minY, $maxX, $maxY]")
+
             if (isScrolling) {
-                Log.d(TAG, "Screen motion detected, but filtered as SCROLLING (Percent: $motionPercent, Height: ${maxY - minY}). Ignoring.")
-            } else if (movingPixelsCount > 80 && minX < maxX && minY < maxY) {
-                // Scale coordinates from tiny space back to captured bitmap space
+                Log.d(TAG, "Screen motion detected, but filtered as SCROLLING. Ignoring.")
+                hasAnalyzedStaticState = false
+            } else if (movingPixelsCount > 40 && minX < maxX && minY < maxY) {
+                hasAnalyzedStaticState = false
                 val scaleX = width.toFloat() / tinyWidth
                 val scaleY = height.toFloat() / tinyHeight
                 
@@ -95,17 +86,35 @@ class MockAIDetector(private val context: Context) : AIDetector {
                 val right = (maxX * scaleX).toInt().coerceAtMost(width)
                 val bottom = (maxY * scaleY).toInt().coerceAtMost(height)
                 
-                Log.d(TAG, "Active Video detected! Bounds: L=$left, T=$top, R=$right, B=$bottom")
-                
                 motionDetection = Detection(
                     boundingBox = Rect(left, top, right, bottom),
-                    confidence = 0.95f, // Mock high confidence for active video
-                    label = "AI Video Content"
+                    confidence = 0.95f,
+                    label = Constants.DETECTION_LABEL
                 )
+            } else if (movingPixelsCount < 15) {
+                if (!hasAnalyzedStaticState) {
+                    Log.d(TAG, "Screen is static. Triggering full-screen analysis.")
+                    motionDetection = Detection(
+                        boundingBox = Rect(0, 0, width, height),
+                        confidence = 1.0f,
+                        label = "STATIC_TRIGGER"
+                    )
+                    hasAnalyzedStaticState = true
+                }
+            } else if (movingPixelsCount > 40) {
+                hasAnalyzedStaticState = false
             }
+        } else {
+            // First frame, trigger static analysis to handle initial screen state
+            Log.d(TAG, "First frame. Triggering initial screen analysis.")
+            motionDetection = Detection(
+                boundingBox = Rect(0, 0, width, height),
+                confidence = 1.0f,
+                label = "STATIC_TRIGGER"
+            )
+            hasAnalyzedStaticState = true
         }
         
-        // Recycle the cached tiny bitmap to prevent accumulation in memory
         prevTiny?.recycle()
         lastTinyBitmap = currentTiny
 
@@ -114,7 +123,7 @@ class MockAIDetector(private val context: Context) : AIDetector {
             detections.add(motionDetection)
         }
         
-        return detections
+        return@withContext detections
     }
 
     companion object {

@@ -4,6 +4,9 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Rect
 import android.util.Log
+import androidx.core.graphics.scale
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import org.tensorflow.lite.Interpreter
 import java.io.FileInputStream
 import java.nio.ByteBuffer
@@ -27,21 +30,21 @@ class TFLiteAIDetector(context: Context) : AIDetector {
     init {
         try {
             // Loads 'slop_detector.tflite' from assets
-            interpreter = Interpreter(loadModelFile(context, "slop_detector.tflite"))
+            interpreter = Interpreter(loadModelFile(context))
             Log.d(TAG, "TFLite interpreter loaded successfully.")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to initialize TFLite interpreter. Make sure 'slop_detector.tflite' exists in assets.", e)
         }
     }
 
-    override fun analyzeFrame(bitmap: Bitmap): List<Detection> {
-        val tflite = interpreter ?: return emptyList()
+    override suspend fun analyzeFrame(bitmap: Bitmap): List<Detection> = withContext(Dispatchers.Default) {
+        val tflite = interpreter ?: return@withContext emptyList()
 
         val width = bitmap.width
         val height = bitmap.height
 
         // 1. Preprocess: Resize bitmap to model's expected input dimensions
-        val resizedBitmap = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
+        val resizedBitmap = bitmap.scale(inputSize, inputSize, true)
         
         // 2. Preprocess: Convert resized bitmap to float ByteBuffer
         // 4 bytes (Float) * inputSize * inputSize * 3 channels (RGB)
@@ -87,7 +90,7 @@ class TFLiteAIDetector(context: Context) : AIDetector {
         } catch (e: Exception) {
             Log.e(TAG, "Error executing TFLite model inference", e)
             resizedBitmap.recycle()
-            return emptyList()
+            return@withContext emptyList()
         }
 
         // Clean up preprocessed bitmap immediately to free RAM
@@ -125,11 +128,11 @@ class TFLiteAIDetector(context: Context) : AIDetector {
             }
         }
 
-        return detections
+        return@withContext detections
     }
 
-    private fun loadModelFile(context: Context, modelName: String): ByteBuffer {
-        val fileDescriptor = context.assets.openFd(modelName)
+    private fun loadModelFile(context: Context): ByteBuffer {
+        val fileDescriptor = context.assets.openFd("slop_detector.tflite")
         val inputStream = FileInputStream(fileDescriptor.fileDescriptor)
         val fileChannel = inputStream.channel
         val startOffset = fileDescriptor.startOffset

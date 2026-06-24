@@ -10,6 +10,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.hardware.display.DisplayManager
@@ -26,10 +27,9 @@ import android.util.DisplayMetrics
 import android.util.Log
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
+import kotlinx.coroutines.*
+import java.util.concurrent.atomic.AtomicBoolean
 
-/**
- * Foreground Service that captures the screen and analyzes frames with AIDetector.
- */
 class ScreenCaptureService : Service() {
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
@@ -37,6 +37,14 @@ class ScreenCaptureService : Service() {
 
     private var backgroundThread: HandlerThread? = null
     private var backgroundHandler: Handler? = null
+    
+    private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    private val isProcessing = AtomicBoolean(false)
+
+    // Pre-allocated Buffers to prevent memory churn
+    private var reusablePaddedBitmap: Bitmap? = null
+    private var reusableCleanBitmap: Bitmap? = null
+    private var canvasClean: Canvas? = null
 
     private lateinit var aiDetector: AIDetector
     private lateinit var floatingWindowManager: FloatingWindowManager
@@ -45,120 +53,96 @@ class ScreenCaptureService : Service() {
 
     private val mediaProjectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
-            Log.d(TAG, "MediaProjection stopped by system. Stopping service.")
             stopSelf()
         }
     }
 
     private val imageAvailableListener = ImageReader.OnImageAvailableListener { reader ->
         val currentTime = System.currentTimeMillis()
-        
-        // Throttling to 1 Frame Per Second (1000 ms)
         if (currentTime - lastProcessedTimeMs < 1000L) {
             val img = try { reader.acquireLatestImage() } catch (e: Exception) { null }
             img?.close()
             return@OnImageAvailableListener
         }
 
-        val image = try {
-            reader.acquireLatestImage()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error acquiring latest image from reader", e)
-            null
-        } ?: return@OnImageAvailableListener
+        val image = try { reader.acquireLatestImage() } catch (e: Exception) { null } ?: return@OnImageAvailableListener
+        
+        Log.d(TAG, "Frame captured at $currentTime")
 
+        // Skip frames safely if AI is still running (prevents memory collisions & coroutine pileups)
+        if (!isProcessing.compareAndSet(false, true)) {
+            image.close()
+            return@OnImageAvailableListener
+        }
+        
         lastProcessedTimeMs = currentTime
 
-        try {
-            val startTime = System.currentTimeMillis()
-            
-            // Convert Image to Bitmap
-            val bitmap = convertImageToBitmap(image)
-            if (bitmap != null) {
-                // Log memory stats
-                val runtime = Runtime.getRuntime()
-                val usedMemory = (runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024)
-                val maxMemory = runtime.maxMemory() / (1024 * 1024)
-                Log.d(TAG, "Current RAM usage: ${usedMemory}MB / ${maxMemory}MB")
+        // Run synchronously to safely extract buffer before closing image
+        val bitmap = convertImageToBitmap(image)
+        image.close() 
 
-                // Analyze frame
-                val inferenceStart = System.currentTimeMillis()
+        if (bitmap == null) {
+            isProcessing.set(false)
+            return@OnImageAvailableListener
+        }
+
+        serviceScope.launch {
+            try {
                 val detections = aiDetector.analyzeFrame(bitmap)
-                val inferenceDuration = System.currentTimeMillis() - inferenceStart
-                val totalDuration = System.currentTimeMillis() - startTime
-                
-                Log.d(TAG, "Frame conversion & analysis took ${totalDuration}ms. ML Inference: ${inferenceDuration}ms. Detections count: ${detections.size}")
 
-                // Load the sensitivity threshold dynamically from SharedPreferences (default: 0.85)
-                val prefs = getSharedPreferences("slop_radar_prefs", Context.MODE_PRIVATE)
-                val threshold = prefs.getFloat("sensitivity_threshold", 0.85f)
+                val prefs = getSharedPreferences(Constants.PREFS_NAME, Context.MODE_PRIVATE)
+                val threshold = prefs.getFloat(Constants.PREF_SENSITIVITY, Constants.DEFAULT_SENSITIVITY)
 
-                // Filter for high-confidence AI detections (> threshold)
                 val aiDetections = detections.filter { it.confidence > threshold }
 
-                if (aiDetections.isNotEmpty()) {
-                    // Map coordinate rectangles from 50% scale back to physical screen size
-                    val windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-                    val metrics = DisplayMetrics()
-                    @Suppress("DEPRECATION")
-                    windowManager.defaultDisplay.getRealMetrics(metrics)
+                withContext(Dispatchers.Main) {
+                    if (aiDetections.isNotEmpty()) {
+                        val windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                        val metrics = DisplayMetrics()
+                        @Suppress("DEPRECATION")
+                        windowManager.defaultDisplay.getRealMetrics(metrics)
 
-                    val screenWidth = metrics.widthPixels
-                    val screenHeight = metrics.heightPixels
+                        val screenWidth = metrics.widthPixels
+                        val screenHeight = metrics.heightPixels
 
-                    val scaleX = screenWidth.toFloat() / image.width
-                    val scaleY = screenHeight.toFloat() / image.height
+                        val scaleX = screenWidth.toFloat() / bitmap.width
+                        val scaleY = screenHeight.toFloat() / bitmap.height
 
-                    val mappedRects = aiDetections.map { det ->
-                        val box = det.boundingBox
-                        Rect(
-                            (box.left * scaleX).toInt(),
-                            (box.top * scaleY).toInt(),
-                            (box.right * scaleX).toInt(),
-                            (box.bottom * scaleY).toInt()
-                        )
+                        val mappedRects = aiDetections.map { det ->
+                            val box = det.boundingBox
+                            Rect(
+                                (box.left * scaleX).toInt(),
+                                (box.top * scaleY).toInt(),
+                                (box.right * scaleX).toInt(),
+                                (box.bottom * scaleY).toInt()
+                            )
+                        }
+                        floatingWindowManager.showHighlights(mappedRects)
+                    } else {
+                        floatingWindowManager.clearHighlights()
                     }
-
-                    Log.d(TAG, "AI Content Detected! Mapped ${mappedRects.size} regions on screen. Triggering warning overlays.")
-                    floatingWindowManager.showHighlights(mappedRects)
-                } else {
-                    // Screen is clean or AI content scrolled away, clear highlights immediately
-                    floatingWindowManager.clearHighlights()
                 }
-
-                // Immediately recycle bitmap to prevent memory accumulation
-                bitmap.recycle()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in frame processing loop", e)
+            } finally {
+                isProcessing.set(false)
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in frame processing loop", e)
-        } finally {
-            // Must close the image to release buffer back to the reader queue
-            image.close()
         }
     }
 
     override fun onCreate() {
         super.onCreate()
-        Log.d(TAG, "Service onCreate()")
+        Log.d(TAG, "onCreate: Service created")
         
-        // --- CHOOSE YOUR DETECTOR ENGINE HERE ---
-        
-        // Option 1: Hugging Face Serverless Cloud API (Real SOTA ViT Model)
-        aiDetector = HuggingFaceAIDetector(this)
-        
-        // Option 2: Local TensorFlow Lite Model (Requires slop_detector.tflite in assets)
-        // aiDetector = TFLiteAIDetector(this)
-        
-        // Option 3: Local Mock Detector (Motion tracking coordinates simulator)
-        // aiDetector = MockAIDetector(this)
+        // Utilize the newly built Architectural Pipeline (Fix 1)
+        aiDetector = HybridPipelineDetector(this)
         
         floatingWindowManager = FloatingWindowManager(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action
-        Log.d(TAG, "Service received command with action: $action")
-        
+        Log.d(TAG, "onStartCommand: action=$action")
         if (action == ACTION_START) {
             val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
             val data = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -168,42 +152,40 @@ class ScreenCaptureService : Service() {
                 intent.getParcelableExtra(EXTRA_RESULT_DATA)
             }
 
+            Log.d(TAG, "onStartCommand: resultCode=$resultCode, data=$data")
             if (data != null && resultCode == Activity.RESULT_OK) {
                 startCaptureService(resultCode, data)
             } else {
-                Log.e(TAG, "Cannot start capture. Invalid resultCode or data intent.")
+                Log.e(TAG, "onStartCommand: Invalid data or resultCode")
                 stopSelf()
             }
         } else if (action == ACTION_STOP) {
             stopSelf()
         }
-
         return START_NOT_STICKY
     }
 
     private fun startCaptureService(resultCode: Int, data: Intent) {
-        if (isRunning) {
-            Log.d(TAG, "Service already running. Ignoring start command.")
-            return
-        }
+        Log.d(TAG, "startCaptureService: isRunning=$isRunning")
+        if (isRunning) return
         isRunning = true
 
-        Log.d(TAG, "Starting screen capture foreground service...")
         createNotificationChannel()
         val notification = buildNotification()
 
-        // Requirements for Media Projection Foreground Service starting from Android 10/14
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+            Log.d(TAG, "startForeground successful")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start foreground service", e)
+            isRunning = false
+            return
         }
 
-        // Run ML analysis and processing on a dedicated background HandlerThread
         backgroundThread = HandlerThread("SlopRadarML").apply { start() }
         backgroundHandler = Handler(backgroundThread!!.looper)
 
@@ -211,6 +193,7 @@ class ScreenCaptureService : Service() {
         mediaProjection = mediaProjectionManager.getMediaProjection(resultCode, data)
         mediaProjection?.registerCallback(mediaProjectionCallback, backgroundHandler)
 
+        Log.d(TAG, "MediaProjection obtained: $mediaProjection")
         setupVirtualDisplay()
     }
 
@@ -220,45 +203,25 @@ class ScreenCaptureService : Service() {
         @Suppress("DEPRECATION")
         windowManager.defaultDisplay.getRealMetrics(metrics)
 
-        val screenWidth = metrics.widthPixels
-        val screenHeight = metrics.heightPixels
-        val screenDensity = metrics.densityDpi
+        val captureWidth = (metrics.widthPixels * 0.5f).toInt()
+        val captureHeight = (metrics.heightPixels * 0.5f).toInt()
+        
+        Log.d(TAG, "setupVirtualDisplay: ${captureWidth}x${captureHeight}, density=${metrics.densityDpi}")
 
-        // Performance Optimization: Capture at 50% scale to reduce memory footprint and latency
-        val scaleFactor = 0.5f
-        val captureWidth = (screenWidth * scaleFactor).toInt()
-        val captureHeight = (screenHeight * scaleFactor).toInt()
-
-        Log.d(TAG, "Virtual Display Setup. Physical: ${screenWidth}x${screenHeight}, Capture Resolution: ${captureWidth}x${captureHeight}")
-
-        // Initialize ImageReader using PixelFormat.RGBA_8888 which aligns with Bitmap
-        imageReader = ImageReader.newInstance(
-            captureWidth,
-            captureHeight,
-            PixelFormat.RGBA_8888,
-            2 // Double buffering
-        )
-
+        imageReader = ImageReader.newInstance(captureWidth, captureHeight, PixelFormat.RGBA_8888, 2)
         imageReader?.setOnImageAvailableListener(imageAvailableListener, backgroundHandler)
 
-        val flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR
         virtualDisplay = mediaProjection?.createVirtualDisplay(
-            "SlopRadarDisplay",
-            captureWidth,
-            captureHeight,
-            screenDensity,
-            flags,
-            imageReader?.surface,
-            null,
-            backgroundHandler
+            "SlopRadarDisplay", captureWidth, captureHeight, metrics.densityDpi,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, imageReader?.surface, null, backgroundHandler
         )
+        Log.d(TAG, "VirtualDisplay created: $virtualDisplay")
     }
 
+    // Zero-Allocation Conversion using persistent Canvas
     private fun convertImageToBitmap(image: Image): Bitmap? {
         val planes = image.planes
         val buffer = planes[0].buffer ?: return null
-        
-        // Rewind buffer to read from start
         buffer.rewind()
 
         val width = image.width
@@ -266,54 +229,43 @@ class ScreenCaptureService : Service() {
         val pixelStride = planes[0].pixelStride
         val rowStride = planes[0].rowStride
         val rowPadding = rowStride - pixelStride * width
+        val bufferWidth = width + rowPadding / pixelStride
 
-        // Create temporary bitmap that includes row padding
-        val bitmap = Bitmap.createBitmap(
-            width + rowPadding / pixelStride,
-            height,
-            Bitmap.Config.ARGB_8888
-        )
-        bitmap.copyPixelsFromBuffer(buffer)
+        if (reusablePaddedBitmap == null || reusablePaddedBitmap!!.width != bufferWidth || reusablePaddedBitmap!!.height != height) {
+            reusablePaddedBitmap?.recycle()
+            reusablePaddedBitmap = Bitmap.createBitmap(bufferWidth, height, Bitmap.Config.ARGB_8888)
+        }
+        reusablePaddedBitmap!!.copyPixelsFromBuffer(buffer)
 
-        // If there was padding, crop it to the clean width of the captured screen
         return if (rowPadding > 0) {
-            val cropped = Bitmap.createBitmap(bitmap, 0, 0, width, height)
-            if (cropped != bitmap) {
-                bitmap.recycle() // Recycle temporary bitmap to prevent memory leak
+            if (reusableCleanBitmap == null || reusableCleanBitmap!!.width != width || reusableCleanBitmap!!.height != height) {
+                reusableCleanBitmap?.recycle()
+                reusableCleanBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                canvasClean = Canvas(reusableCleanBitmap!!)
             }
-            cropped
+            // Draw padded image exactly at 0,0 - implicitly cropping extra right-side buffer
+            canvasClean!!.drawBitmap(reusablePaddedBitmap!!, 0f, 0f, null)
+            reusableCleanBitmap
         } else {
-            bitmap
+            reusablePaddedBitmap
         }
     }
 
     private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                "Screen Analysis Service",
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = "Notifies that SlopRadar is scanning screen in real-time."
-            }
-            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            manager.createNotificationChannel(channel)
-        }
+        val channel = NotificationChannel(CHANNEL_ID, "Screen Analysis Service", NotificationManager.IMPORTANCE_LOW)
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        manager.createNotificationChannel(channel)
     }
 
     private fun buildNotification(): Notification {
-        val intent = Intent(this, MainActivity::class.java)
         val pendingIntent = PendingIntent.getActivity(
-            this,
-            0,
-            intent,
+            this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("SlopRadar Shield Active")
             .setContentText("Scanning screen in background...")
-            .setSmallIcon(android.R.drawable.ic_menu_compass) // Default system icon
+            .setSmallIcon(android.R.drawable.ic_menu_compass)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
@@ -321,41 +273,33 @@ class ScreenCaptureService : Service() {
     }
 
     override fun onDestroy() {
-        Log.d(TAG, "onDestroy() - Stopping capture and cleaning up allocations")
-        
         floatingWindowManager.clearHighlights()
 
-        virtualDisplay?.release()
-        virtualDisplay = null
+        serviceScope.cancel()
+        reusablePaddedBitmap?.recycle()
+        reusablePaddedBitmap = null
+        reusableCleanBitmap?.recycle()
+        reusableCleanBitmap = null
 
+        virtualDisplay?.release()
         imageReader?.setOnImageAvailableListener(null, null)
         imageReader?.close()
-        imageReader = null
-
         mediaProjection?.unregisterCallback(mediaProjectionCallback)
         mediaProjection?.stop()
-        mediaProjection = null
-
         backgroundThread?.quitSafely()
-        backgroundThread = null
-        backgroundHandler = null
-
+        
         isRunning = false
         super.onDestroy()
     }
 
-    override fun onBind(intent: Intent?): IBinder? {
-        return null
-    }
+    override fun onBind(intent: Intent?): IBinder? = null
 
     companion object {
         private const val TAG = "ScreenCaptureService"
         private const val NOTIFICATION_ID = 888
         private const val CHANNEL_ID = "slop_radar_channel"
-
         const val ACTION_START = "com.example.slopradar.action.START"
         const val ACTION_STOP = "com.example.slopradar.action.STOP"
-
         const val EXTRA_RESULT_CODE = "com.example.slopradar.extra.RESULT_CODE"
         const val EXTRA_RESULT_DATA = "com.example.slopradar.extra.RESULT_DATA"
 

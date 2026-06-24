@@ -9,6 +9,7 @@ import android.os.Bundle
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.viewModels
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -23,6 +24,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -30,14 +32,11 @@ import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
 
+    private val viewModel: MainViewModel by viewModels()
     private var overlayGranted by mutableStateOf(false)
     private var isServiceRunning by mutableStateOf(false)
-    private var sensitivityThreshold by mutableStateOf(0.85f)
-    
-    // Lifecycle flag to prevent onResume from overwriting the state during asynchronous service startup
     private var justStartedService = false
 
-    // Activity launcher for capturing MediaProjection permission dialog result
     private val mediaProjectionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -56,23 +55,15 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         
-        // Load settings from SharedPreferences
-        val prefs = getSharedPreferences("slop_radar_prefs", Context.MODE_PRIVATE)
-        sensitivityThreshold = prefs.getFloat("sensitivity_threshold", 0.85f)
-
         setContent {
             SlopRadarTheme {
+                val sensitivityThreshold by viewModel.sensitivityThreshold.collectAsState()
+
                 MainScreen(
                     overlayGranted = overlayGranted,
                     isServiceRunning = isServiceRunning,
                     sensitivityThreshold = sensitivityThreshold,
-                    onSensitivityChanged = { value ->
-                        sensitivityThreshold = value
-                        getSharedPreferences("slop_radar_prefs", Context.MODE_PRIVATE)
-                            .edit()
-                            .putFloat("sensitivity_threshold", value)
-                            .apply()
-                    },
+                    onSensitivityChanged = { viewModel.updateSensitivity(it) },
                     onGrantOverlayClick = { requestOverlayPermission() },
                     onToggleServiceClick = { toggleRadarService() }
                 )
@@ -82,16 +73,11 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        // Sync permission and service status states reactively
         overlayGranted = Settings.canDrawOverlays(this)
-        
         if (!justStartedService) {
             isServiceRunning = ScreenCaptureService.isRunning
         }
-        justStartedService = false // Reset the flag
-        
-        val prefs = getSharedPreferences("slop_radar_prefs", Context.MODE_PRIVATE)
-        sensitivityThreshold = prefs.getFloat("sensitivity_threshold", 0.85f)
+        justStartedService = false 
     }
 
     private fun requestOverlayPermission() {
@@ -115,6 +101,8 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
+
+
 
 @Composable
 fun SlopRadarTheme(content: @Composable () -> Unit) {
