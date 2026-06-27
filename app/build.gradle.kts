@@ -1,4 +1,5 @@
 import java.util.Properties
+import java.io.FileInputStream
 
 plugins {
     id("com.android.application")
@@ -21,17 +22,12 @@ android {
             useSupportLibrary = true
         }
 
-        // Read Hugging Face API Token from root .env file at compile-time
         val envFile = project.rootProject.file(".env")
-        val properties = Properties()
         var hfToken = ""
         if (envFile.exists()) {
-            try {
-                envFile.inputStream().use { properties.load(it) }
-                hfToken = properties.getProperty("HF_API_TOKEN", "") ?: ""
-            } catch (e: Exception) {
-                project.logger.error("Failed to load .env file", e)
-            }
+            val props = Properties()
+            FileInputStream(envFile).use { props.load(it) }
+            hfToken = props.getProperty("HF_API_TOKEN", "")
         }
         buildConfigField("String", "HF_API_TOKEN", "\"$hfToken\"")
     }
@@ -60,6 +56,9 @@ android {
         kotlinCompilerExtensionVersion = "1.5.8"
     }
     packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
@@ -76,6 +75,13 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
     
+    // Asynchronous Networking & Coroutines
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+    
+    // ViewModel Compose
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.7.0")
+
     // TensorFlow Lite
     implementation("org.tensorflow:tensorflow-lite:2.14.0")
 

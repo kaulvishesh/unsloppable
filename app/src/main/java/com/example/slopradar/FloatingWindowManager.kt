@@ -15,6 +15,7 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.TextView
+import androidx.core.graphics.toColorInt
 
 /**
  * Controller to show and hide high-quality, animated warning highlights on the screen.
@@ -100,7 +101,7 @@ class FloatingWindowManager(private val context: Context) {
                 }
             } else {
                 // ADD: Create a new overlay window since we have more detections
-                val highlightView = createHighlightView(width, height)
+                val highlightView = createHighlightView()
                 
                 val params = WindowManager.LayoutParams(
                     width,
@@ -116,6 +117,11 @@ class FloatingWindowManager(private val context: Context) {
                     y = rect.top
                     // Enter/Exit transition is only triggered when first added or finally removed
                     windowAnimations = android.R.style.Animation_Toast
+                    
+                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+                        flags = flags or WindowManager.LayoutParams.FLAG_BLUR_BEHIND
+                        blurBehindRadius = 45
+                    }
                 }
                 
                 try {
@@ -158,18 +164,35 @@ class FloatingWindowManager(private val context: Context) {
     }
 
     /**
+     * Animates the border alpha with a smooth pulsing effect.
+     * Stores the animator reference in the view's tag for clean lifecycle tracking.
+     */
+    private fun startPulsingAnimation(view: View) {
+        val animator = ValueAnimator.ofFloat(0.35f, 1.0f).apply {
+            duration = 900
+            repeatMode = ValueAnimator.REVERSE
+            repeatCount = ValueAnimator.INFINITE
+            addUpdateListener { anim ->
+                view.alpha = anim.animatedValue as Float
+            }
+        }
+        animator.start()
+        view.tag = animator
+    }
+
+    /**
      * Creates a transparent view with a glowing red border and a warning pill badge.
      */
-    private fun createHighlightView(width: Int, height: Int): View {
+    private fun createHighlightView(): View {
         val root = FrameLayout(context).apply {
             isClickable = false
             isFocusable = false
-            
-            // Glowing red stroke border (stretches dynamically when layout size is updated)
+
+            // Glowing border
             val borderDrawable = GradientDrawable().apply {
                 shape = GradientDrawable.RECTANGLE
                 setColor(Color.TRANSPARENT)
-                setStroke(6, Color.parseColor("#E53935"))
+                setStroke(6, Constants.BORDER_COLOR_HEX.toColorInt())
                 cornerRadius = 24f
             }
             background = borderDrawable
@@ -177,15 +200,15 @@ class FloatingWindowManager(private val context: Context) {
 
         // Warning Badge Pill
         val warningBadge = TextView(context).apply {
-            text = "⚠️ AI SLOP DETECTED"
+            text = Constants.WARNING_BADGE_TEXT
             setTextColor(Color.WHITE)
             textSize = 10f
             typeface = Typeface.create("sans-serif-black", Typeface.BOLD)
             setPadding(16, 8, 16, 8)
-            
+
             val badgeBg = GradientDrawable().apply {
                 shape = GradientDrawable.RECTANGLE
-                setColor(Color.parseColor("#E53935"))
+                setColor(Constants.BORDER_COLOR_HEX.toColorInt())
                 cornerRadius = 16f
             }
             background = badgeBg
@@ -204,24 +227,9 @@ class FloatingWindowManager(private val context: Context) {
         return root
     }
 
-    /**
-     * Animates the border alpha with a smooth pulsing effect.
-     * Stores the animator reference in the view's tag for clean lifecycle tracking.
-     */
-    private fun startPulsingAnimation(view: View) {
-        val animator = ValueAnimator.ofFloat(0.35f, 1.0f).apply {
-            duration = 900
-            repeatMode = ValueAnimator.REVERSE
-            repeatCount = ValueAnimator.INFINITE
-            addUpdateListener { anim ->
-                view.alpha = anim.animatedValue as Float
-            }
-        }
-        animator.start()
-        view.tag = animator
-    }
-
     companion object {
         private const val TAG = "FloatingWindowManager"
     }
+
+
 }

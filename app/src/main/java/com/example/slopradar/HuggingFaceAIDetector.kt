@@ -4,117 +4,123 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Rect
 import android.util.Log
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
-import java.net.HttpURLConnection
-import java.net.URL
+import java.util.concurrent.TimeUnit
 
-/**
- * A cloud-connected implementation of AIDetector that uses the Hugging Face Inference API.
- * It sends cropped image/video frames to a SOTA vision transformer model for AI classification.
- */
 class HuggingFaceAIDetector(private val context: Context) : AIDetector {
 
-    private val defaultModelId = "umm-maybe/AI-image-detector"
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(10, TimeUnit.SECONDS)
+        .build()
 
-    override fun analyzeFrame(bitmap: Bitmap): List<Detection> {
+    override suspend fun analyzeFrame(bitmap: Bitmap): List<Detection> = withContext(Dispatchers.IO) {
         val width = bitmap.width
         val height = bitmap.height
 
-        // 1. Fetch settings dynamically (model ID and auth token)
-        val prefs = context.getSharedPreferences("slop_radar_prefs", Context.MODE_PRIVATE)
-        val modelId = prefs.getString("selected_model_id", defaultModelId) ?: defaultModelId
+        val prefs = context.getSharedPreferences(Constants.PREFS_NAME, Context.MODE_PRIVATE)
+        val modelId = prefs.getString(Constants.PREF_MODEL_ID, Constants.DEFAULT_MODEL_ID) ?: Constants.DEFAULT_MODEL_ID
         val endpointUrl = "https://api-inference.huggingface.co/models/$modelId"
 
-        var token = prefs.getString("hf_api_token", "") ?: ""
+        var token = prefs.getString(Constants.PREF_HF_TOKEN, "") ?: ""
+        if (token.isEmpty()) token = BuildConfig.HF_API_TOKEN
+
         if (token.isEmpty()) {
-            token = BuildConfig.HF_API_TOKEN
-        }
-        
-        if (token.isEmpty()) {
-            Log.w(TAG, "Hugging Face API token is missing. Inference request may fail or be rate-limited.")
+            Log.w(TAG, "Hugging Face API Token is empty! Detection will likely fail.")
+        } else {
+            val masked = if (token.length > 8) "${token.take(4)}...${token.takeLast(4)}" else "****"
+            Log.d(TAG, "Using Token: $masked (len=${token.length})")
         }
 
-        // 2. Compress the bitmap into JPEG bytes to send over the network
         val outputStream = ByteArrayOutputStream()
         bitmap.compress(Bitmap.CompressFormat.JPEG, 75, outputStream)
         val jpegBytes = outputStream.toByteArray()
-        Log.d(TAG, "Compressed frame size for upload: ${jpegBytes.size / 1024} KB")
 
-        // 3. Make HTTP request to Hugging Face Serverless API
-        var connection: HttpURLConnection? = null
-        try {
-            val url = URL(endpointUrl)
-            connection = (url.openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                doOutput = true
-                connectTimeout = 5000
-                readTimeout = 5000
-                setRequestProperty("Content-Type", "image/jpeg")
-                if (token.isNotEmpty()) {
-                    setRequestProperty("Authorization", "Bearer $token")
-                }
-            }
+        val requestBuilder = Request.Builder()
+            .url(endpointUrl)
+            .post(jpegBytes.toRequestBody("image/jpeg".toMediaType()))
 
-            // Write binary JPEG payload
-            connection.outputStream.use { os ->
-                os.write(jpegBytes)
-                os.flush()
-            }
-
-            // Check response status
-            val responseCode = connection.responseCode
-            if (responseCode == HttpURLConnection.HTTP_OK) {
-                val responseString = connection.inputStream.bufferedReader().use { it.readText() }
-                Log.d(TAG, "Inference API response: $responseString")
-
-                val trimmed = responseString.trim()
-                var aiScore = 0.0f
-
-                // 4. Robust JSON Parsing (Handles loading JSONObject vs result JSONArray)
-                if (trimmed.startsWith("{")) {
-                    val jsonObj = JSONObject(trimmed)
-                    if (jsonObj.has("error")) {
-                        Log.w(TAG, "Hugging Face API returned a loading warning or error: ${jsonObj.getString("error")}")
-                        return emptyList()
-                    }
-                } else if (trimmed.startsWith("[")) {
-                    val jsonArray = JSONArray(trimmed)
-                    for (i in 0 until jsonArray.length()) {
-                        val obj = jsonArray.getJSONObject(i)
-                        val label = obj.getString("label").lowercase()
-                        val score = obj.getDouble("score").toFloat()
-
-                        if (label == "artificial" || label == "fake" || label.contains("synthetic") || label.contains("ai")) {
-                            aiScore = score
-                        }
-                    }
-                }
-
-                Log.d(TAG, "Classified AI Confidence Score: $aiScore")
-                
-                // Return detection bounding box covering the entire analyzed cropped container
-                return listOf(
-                    Detection(
-                        boundingBox = Rect(0, 0, width, height),
-                        confidence = aiScore,
-                        label = "AI Content Detected"
-                    )
-                )
-            } else {
-                val errString = connection.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
-                Log.e(TAG, "Inference API returned error code $responseCode: $errString")
-            }
-
-        } catch (e: Exception) {
-            // Append e.message to the main log string to make it visible under filters
-            Log.e(TAG, "Failed to run Hugging Face cloud inference. Error: ${e.message}", e)
-        } finally {
-            connection?.disconnect()
+        if (token.isNotEmpty()) {
+            requestBuilder.addHeader("Authorization", "Bearer $token")
         }
 
-        return emptyList()
+        var attempts = 0
+        val maxAttempts = 6 // Initial attempt + 5 retries
+        val delayMs = 4000L
+
+        while (attempts < maxAttempts) {
+            try {
+                val response = client.newCall(requestBuilder.build()).execute()
+                if (response.isSuccessful) {
+                    val responseString = response.body?.string() ?: ""
+                    val trimmed = responseString.trim()
+                    var aiScore = 0.0f
+
+                    if (trimmed.startsWith("{")) {
+                        val jsonObj = JSONObject(trimmed)
+                        if (jsonObj.has("error")) {
+                            val errorMsg = jsonObj.getString("error")
+                            Log.w(TAG, "Hugging Face API returned error: $errorMsg")
+                            if (errorMsg.contains("loading", ignoreCase = true)) {
+                                attempts++
+                                Log.i(TAG, "Model is loading. Retrying attempt $attempts of $maxAttempts after ${delayMs}ms...")
+                                kotlinx.coroutines.delay(delayMs)
+                                continue
+                            }
+                            return@withContext emptyList()
+                        }
+                    } else if (trimmed.startsWith("[")) {
+                        val jsonArray = JSONArray(trimmed)
+                        for (i in 0 until jsonArray.length()) {
+                            val obj = jsonArray.getJSONObject(i)
+                            val label = obj.getString("label").lowercase()
+                            val score = obj.getDouble("score").toFloat()
+                            
+                            Log.d(TAG, "API Result: label=$label, score=$score")
+
+                            if (label == "artificial" || label == "fake" || label.contains("synthetic") || label.contains("ai")) {
+                                aiScore = score
+                            }
+                        }
+                    }
+
+                    return@withContext listOf(
+                        Detection(
+                            boundingBox = Rect(0, 0, width, height),
+                            confidence = aiScore,
+                            label = Constants.DETECTION_LABEL
+                        )
+                    )
+                } else {
+                    Log.e(TAG, "Inference API returned error code ${response.code}")
+                    if (response.code == 429 || response.code == 503 || response.code == 504) {
+                        attempts++
+                        Log.i(TAG, "Server error (${response.code}). Retrying attempt $attempts of $maxAttempts after ${delayMs}ms...")
+                        kotlinx.coroutines.delay(delayMs)
+                        continue
+                    }
+                    return@withContext emptyList()
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to run Hugging Face cloud inference.", e)
+                attempts++
+                if (attempts < maxAttempts) {
+                    Log.i(TAG, "Network exception. Retrying attempt $attempts of $maxAttempts after ${delayMs}ms...")
+                    kotlinx.coroutines.delay(delayMs)
+                    continue
+                }
+            }
+        }
+        
+        return@withContext emptyList()
     }
 
     companion object {
