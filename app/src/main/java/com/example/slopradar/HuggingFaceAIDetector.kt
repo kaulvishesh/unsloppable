@@ -28,7 +28,8 @@ class HuggingFaceAIDetector(private val context: Context) : AIDetector {
 
         val prefs = context.getSharedPreferences(Constants.PREFS_NAME, Context.MODE_PRIVATE)
         val modelId = prefs.getString(Constants.PREF_MODEL_ID, Constants.DEFAULT_MODEL_ID) ?: Constants.DEFAULT_MODEL_ID
-        val endpointUrl = "https://api-inference.huggingface.co/models/$modelId"
+        // Fix: Use correct router URL with /hf-inference path prefix
+        val endpointUrl = "https://router.huggingface.co/hf-inference/models/$modelId"
 
         var token = prefs.getString(Constants.PREF_HF_TOKEN, "") ?: ""
         if (token.isEmpty()) token = BuildConfig.HF_API_TOKEN
@@ -58,56 +59,57 @@ class HuggingFaceAIDetector(private val context: Context) : AIDetector {
 
         while (attempts < maxAttempts) {
             try {
-                val response = client.newCall(requestBuilder.build()).execute()
-                if (response.isSuccessful) {
-                    val responseString = response.body?.string() ?: ""
-                    val trimmed = responseString.trim()
-                    var aiScore = 0.0f
+                client.newCall(requestBuilder.build()).execute().use { response ->
+                    if (response.isSuccessful) {
+                        val responseString = response.body?.string() ?: ""
+                        val trimmed = responseString.trim()
+                        var aiScore = 0.0f
 
-                    if (trimmed.startsWith("{")) {
-                        val jsonObj = JSONObject(trimmed)
-                        if (jsonObj.has("error")) {
-                            val errorMsg = jsonObj.getString("error")
-                            Log.w(TAG, "Hugging Face API returned error: $errorMsg")
-                            if (errorMsg.contains("loading", ignoreCase = true)) {
-                                attempts++
-                                Log.i(TAG, "Model is loading. Retrying attempt $attempts of $maxAttempts after ${delayMs}ms...")
-                                kotlinx.coroutines.delay(delayMs)
-                                continue
+                        if (trimmed.startsWith("{")) {
+                            val jsonObj = JSONObject(trimmed)
+                            if (jsonObj.has("error")) {
+                                val errorMsg = jsonObj.getString("error")
+                                Log.w(TAG, "Hugging Face API returned error: $errorMsg")
+                                if (errorMsg.contains("loading", ignoreCase = true)) {
+                                    attempts++
+                                    Log.i(TAG, "Model is loading. Retrying attempt $attempts of $maxAttempts after ${delayMs}ms...")
+                                    kotlinx.coroutines.delay(delayMs)
+                                    return@use
+                                }
+                                return@withContext emptyList()
                             }
-                            return@withContext emptyList()
-                        }
-                    } else if (trimmed.startsWith("[")) {
-                        val jsonArray = JSONArray(trimmed)
-                        for (i in 0 until jsonArray.length()) {
-                            val obj = jsonArray.getJSONObject(i)
-                            val label = obj.getString("label").lowercase()
-                            val score = obj.getDouble("score").toFloat()
-                            
-                            Log.d(TAG, "API Result: label=$label, score=$score")
+                        } else if (trimmed.startsWith("[")) {
+                            val jsonArray = JSONArray(trimmed)
+                            for (i in 0 until jsonArray.length()) {
+                                val obj = jsonArray.getJSONObject(i)
+                                val label = obj.getString("label").lowercase()
+                                val score = obj.getDouble("score").toFloat()
+                                
+                                Log.d(TAG, "API Result: label=$label, score=$score")
 
-                            if (label == "artificial" || label == "fake" || label.contains("synthetic") || label.contains("ai")) {
-                                aiScore = score
+                                if (label == "artificial" || label == "fake" || label.contains("synthetic") || label.contains("ai")) {
+                                    aiScore = score
+                                }
                             }
                         }
-                    }
 
-                    return@withContext listOf(
-                        Detection(
-                            boundingBox = Rect(0, 0, width, height),
-                            confidence = aiScore,
-                            label = Constants.DETECTION_LABEL
+                        return@withContext listOf(
+                            Detection(
+                                boundingBox = Rect(0, 0, width, height),
+                                confidence = aiScore,
+                                label = Constants.DETECTION_LABEL
+                            )
                         )
-                    )
-                } else {
-                    Log.e(TAG, "Inference API returned error code ${response.code}")
-                    if (response.code == 429 || response.code == 503 || response.code == 504) {
-                        attempts++
-                        Log.i(TAG, "Server error (${response.code}). Retrying attempt $attempts of $maxAttempts after ${delayMs}ms...")
-                        kotlinx.coroutines.delay(delayMs)
-                        continue
+                    } else {
+                        Log.e(TAG, "Inference API returned error code ${response.code}")
+                        if (response.code == 429 || response.code == 503 || response.code == 504) {
+                            attempts++
+                            Log.i(TAG, "Server error (${response.code}). Retrying attempt $attempts of $maxAttempts after ${delayMs}ms...")
+                            kotlinx.coroutines.delay(delayMs)
+                            return@use
+                        }
+                        return@withContext emptyList()
                     }
-                    return@withContext emptyList()
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to run Hugging Face cloud inference.", e)
@@ -115,7 +117,6 @@ class HuggingFaceAIDetector(private val context: Context) : AIDetector {
                 if (attempts < maxAttempts) {
                     Log.i(TAG, "Network exception. Retrying attempt $attempts of $maxAttempts after ${delayMs}ms...")
                     kotlinx.coroutines.delay(delayMs)
-                    continue
                 }
             }
         }
